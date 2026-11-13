@@ -1,0 +1,19 @@
+.artifacts/
+
+# code-review-graph AST database
+.code-review-graph/
+
+# Python & Executables
+__pycache__/
+*.pyc
+*.exe
+build/
+dist/
+
+# Sensitive tokens & cookies
+cookie.txt*
+*token*.txt
+session_tokens.txt
+access_tokens.txt
+.env
+launch.log

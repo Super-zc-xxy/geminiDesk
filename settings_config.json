@@ -1,0 +1,6 @@
+{
+    "port": 8090,
+    "api_key": "sk-gemini-argon",
+    "selected_model": "gemini-4-hydrogen",
+    "auto_start": true
+}

@@ -1,0 +1,12 @@
+{
+    "services": [
+        {
+            "id": "gemini",
+            "name": "Google Gemini (4 Argon)",
+            "exec_path": "E:\\GeminiDeskTop\\gemini-web2api.exe",
+            "port": 8081,
+            "work_dir": "E:\\GeminiDeskTop",
+            "auto_start": true
+        }
+    ]
+}
