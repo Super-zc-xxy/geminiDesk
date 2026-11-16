@@ -288,6 +288,9 @@ class TestGatewayRouting(unittest.TestCase):
             async def aiter_raw(self):
                 yield b'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n'
                 yield b'data: [DONE]\n\n'
+            async def aiter_lines(self):
+                yield 'data: {"choices":[{"delta":{"content":"Hello"}}]}'
+                yield 'data: [DONE]'
             async def aclose(self):
                 pass
 
@@ -317,6 +320,76 @@ class TestGatewayRouting(unittest.TestCase):
 
             output = asyncio.run(read_stream(resp))
             self.assertIn("Hello", output)
+            self.assertIn("[DONE]", output)
+            self.assertTrue(mock_client.is_closed)
+
+    def test_chat_completions_trae_probe_empty_stream_fallback(self):
+        """10. 验证 Trae 连通性探针（图片+空文本）以及上游空流时的保底文本注入"""
+        class DummyRequest:
+            def __init__(self, body):
+                self._body = body
+                self.headers = {}
+            async def json(self):
+                return self._body
+
+        # 模拟 Trae 发送的探针请求
+        trae_probe_req = DummyRequest({
+            "model": "webApi",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}},
+                    {"type": "text", "text": ""}
+                ]
+            }],
+            "stream": True
+        })
+
+        # 模拟上游核心只返回 null content 并 DONE
+        class MockEmptyStreamResponse:
+            status_code = 200
+            headers = {"content-type": "text/event-stream"}
+            async def aiter_lines(self):
+                yield 'data: {"choices":[{"delta":{"content":null}}]}'
+                yield 'data: [DONE]'
+            async def aclose(self):
+                pass
+
+        class MockClient:
+            def __init__(self, *args, **kwargs):
+                self.is_closed = False
+                self.last_body = None
+            def build_request(self, method, url, **kwargs):
+                self.last_body = kwargs.get("json")
+                return None
+            async def send(self, req, stream=False):
+                return MockEmptyStreamResponse()
+            async def aclose(self):
+                self.is_closed = True
+
+        mock_client = MockClient()
+        with patch("gateway_server.httpx.AsyncClient", return_value=mock_client):
+            resp = asyncio.run(gateway_server.chat_completions(trae_probe_req))
+            self.assertEqual(resp.media_type, "text/event-stream")
+
+            # 验证请求体被规范化（提取了占位提示语，而不是带坏图片直接丢给后端）
+            self.assertEqual(
+                mock_client.last_body["messages"][0]["content"],
+                "你好，这是一次连通性测试。"
+            )
+
+            async def read_stream(streaming_resp):
+                chunks = []
+                async for chunk in streaming_resp.body_iterator:
+                    if isinstance(chunk, bytes):
+                        chunks.append(chunk.decode("utf-8"))
+                    else:
+                        chunks.append(chunk)
+                return "".join(chunks)
+
+            output = asyncio.run(read_stream(resp))
+            # 必须产出保底文本，杜绝 Trae 报 empty stream
+            self.assertIn("Web2API 双引擎网关已就绪", output)
             self.assertIn("[DONE]", output)
             self.assertTrue(mock_client.is_closed)
 
