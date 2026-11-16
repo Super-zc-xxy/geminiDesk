@@ -21,3 +21,5 @@ session_tokens.txt
 access_tokens.txt
 .env
 launch.log
+
+gateway_access.log

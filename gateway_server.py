@@ -8,6 +8,7 @@ import httpx
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 if getattr(sys, 'frozen', False):
@@ -15,6 +16,7 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "settings_config.json")
+LOG_FILE = os.path.join(BASE_DIR, "gateway_access.log")
 INTERNAL_GEMINI_PORT = 8085
 INTERNAL_DEEPSEEK_PORT = 8087
 
@@ -29,6 +31,48 @@ async def lifespan(app: FastAPI):
     await http_client.aclose()
 
 app = FastAPI(title="Web2API Dual-Engine Universal Gateway", lifespan=lifespan)
+
+# 允许全源跨域访问，支持 VS Code / Trae / Web 客户端的 OPTIONS 预检请求
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.middleware("http")
+async def request_logger_middleware(request: Request, call_next):
+    client_ip = request.client.host if request.client else "unknown"
+    method = request.method
+    url_path = request.url.path
+    query = request.url.query
+    full_url = f"{url_path}?{query}" if query else url_path
+
+    body_preview = ""
+    if method in ("POST", "PUT", "PATCH"):
+        try:
+            req_body = await request.body()
+            body_preview = req_body[:300].decode("utf-8", errors="ignore").replace("\n", " ")
+            async def receive():
+                return {"type": "http.request", "body": req_body, "more_body": False}
+            request = Request(request.scope, receive)
+        except Exception:
+            pass
+
+    response = await call_next(request)
+    log_line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {client_ip} {method} {full_url} -> {response.status_code} | Body: {body_preview}\n"
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(log_line)
+    except Exception:
+        pass
+    return response
+
+@app.get("/")
+@app.get("/v1")
+async def health_check():
+    return {"status": "ok", "service": "Web2API Gateway", "time": int(time.time())}
 
 def get_current_model_choice():
     """读取用户在 UI 中选择的目标模型"""
@@ -89,6 +133,11 @@ def get_engine_port(engine: str) -> int:
     return INTERNAL_DEEPSEEK_PORT if engine == "deepseek" else INTERNAL_GEMINI_PORT
 
 @app.get("/v1/models")
+@app.get("/v1/models/")
+@app.get("/models")
+@app.get("/models/")
+@app.get("/v1/chat/completions/models")
+@app.get("/chat/completions/models")
 async def list_models():
     now = int(time.time())
     models_set = {
@@ -361,6 +410,13 @@ def extract_text_content(val):
 
 # ================= 兼容常规客户端 (/v1/chat/completions) =================
 @app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions/")
+@app.post("/chat/completions")
+@app.post("/chat/completions/")
+@app.post("/v1/chat/completions/chat/completions")
+@app.post("/v1/chat/completions/chat/completions/")
+@app.post("/chat/completions/chat/completions")
+@app.post("/chat/completions/chat/completions/")
 async def chat_completions(request: Request):
     body = await request.json()
     client_model = body.get("model", "")
