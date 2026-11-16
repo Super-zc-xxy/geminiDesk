@@ -141,6 +141,9 @@ def get_engine_port(engine: str) -> int:
 async def list_models():
     now = int(time.time())
     models_set = {
+        # 通用与聚合模型标识
+        "webApi",
+        "default",
         # Gemini 家族模型
         "gemini-4-hydrogen",
         "hydrogen",
@@ -661,7 +664,32 @@ async def chat_completions(request: Request):
             )
         except Exception as e:
             await client.aclose()
-            return JSONResponse({"error": {"message": f"代理转接异常: {str(e)}"}}, status_code=500)
+            err_msg = f"【代理请求异常】：{str(e)}"
+            if isinstance(e, httpx.TimeoutException):
+                err_msg = f"【上游响应超时】：请求 {target_model} 超过 120 秒未返回。若使用的是 Gemini 模型，请检查科学上网代理状态；若需快速响应，推荐切换至 deepseek-v4.1-flash 模型！"
+            err_chunk = {
+                "id": f"chatcmpl-err-{uuid.uuid4().hex[:8]}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": target_model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": err_msg},
+                    "finish_reason": "stop"
+                }]
+            }
+            async def exc_stream():
+                yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
+            return StreamingResponse(
+                exc_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"
+                }
+            )
     else:
         try:
             async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
