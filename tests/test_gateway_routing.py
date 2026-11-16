@@ -453,5 +453,24 @@ class TestGatewayRouting(unittest.TestCase):
             self.assertIn("网页登录凭据可能已失效或过期", body_dict["error"]["message"])
             self.assertTrue(mock_client.is_closed)
 
+    def test_marvis_ping_probe(self):
+        """13. 验证马维斯 (Marvis) 等客户端发送的 ping 探测立即返回 pong (无需等待上游)"""
+        class DummyRequest:
+            def __init__(self, body):
+                self._body = body
+                self.headers = {}
+            async def json(self):
+                return self._body
+
+        req = DummyRequest({
+            "model": "webApi",
+            "messages": [{"role": "user", "content": "ping"}],
+            "stream": False
+        })
+        resp = asyncio.run(gateway_server.chat_completions(req))
+        self.assertEqual(resp.status_code, 200)
+        body_dict = json.loads(resp.body.decode("utf-8"))
+        self.assertEqual(body_dict["choices"][0]["message"]["content"], "pong")
+
 if __name__ == "__main__":
     unittest.main()

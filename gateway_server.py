@@ -461,7 +461,11 @@ def extract_text_content(val):
         return " ".join(parts)
     return ""
 
-# ================= 兼容常规客户端 (/v1/chat/completions) =================
+# ================= 兼容常规客户端 (/v1/chat/completions 及 /v1 直接请求) =================
+@app.post("/v1")
+@app.post("/v1/")
+@app.post("/")
+@app.post("")
 @app.post("/v1/chat/completions")
 @app.post("/v1/chat/completions/")
 @app.post("/chat/completions")
@@ -522,6 +526,40 @@ async def chat_completions(request: Request):
         body["messages"] = normalized_messages
     else:
         body["messages"] = [{"role": "user", "content": "你好"}]
+
+    # 针对部分客户端（如马维斯 Marvis 等）发送的 ping 连通性探测进行快速响应
+    if len(normalized_messages) == 1 and str(normalized_messages[0].get("content", "")).strip().lower() == "ping":
+        pong_id = f"chatcmpl-pong-{uuid.uuid4().hex[:8]}"
+        now = int(time.time())
+        if not is_stream:
+            return JSONResponse({
+                "id": pong_id,
+                "object": "chat.completion",
+                "created": now,
+                "model": target_model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "pong"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }, status_code=200)
+        else:
+            async def pong_stream():
+                chunk = {
+                    "id": pong_id,
+                    "object": "chat.completion.chunk",
+                    "created": now,
+                    "model": target_model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": "pong"},
+                        "finish_reason": "stop"
+                    }]
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
+            return StreamingResponse(pong_stream(), media_type="text/event-stream")
 
     if is_stream:
         client = httpx.AsyncClient(timeout=120.0, trust_env=False)
