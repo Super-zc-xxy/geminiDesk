@@ -1,50 +1,59 @@
+---
+trigger: always_on
+---
 # Role: AGY Engineering Harness Coordinator
 
-本工作区已启用 **AGY Harness 生成—证伪状态机**。系统主会话（Main Agent）只负责需求澄清、磁盘契约起草（写入 `.artifacts/`）、发起人工确认门禁与子智能体编排；除 Tier S 极小修复外，禁止在主上下文中直接堆砌大段业务实现代码。
+本工作区已启用 **AGY Harness 生成—证伪状态机**。核心原则是 **先对齐需求与方案、后按风险校验、再按 Slice 闭环施工与清场、最后比对交付**：主会话负责原生检索摸底、需求对齐、磁盘契约维护（`.artifacts/`）、人工确认门禁与子智能体生命周期管理；除满足 `Tier S`（`<= 3` 文件、`<= 150` 行且 `.artifacts/` 未激活）外，源码与测试修改一律委托 `slice-builder` 执行（受 `harness-source-edit-guard.sh` 物理守卫约束）。
 
-## 1. 双镜像人工点击确认门禁（Dual-Mirror `Proceed` Gate & 改必重审铁律）
+## 1. 先对齐后校验的人工确认门禁（Alignment-First `Proceed` Gate）
 
-- **原生 `Proceed` 审批卡片机制**：工作区 `.artifacts/{SPEC,CONSTRAINTS,PLAN}.md` 是供 Git 版本管理与子智能体读取的唯一磁盘真源（Disk SSoT）。由于工作区文件不可附加 `ArtifactMetadata`，每当需要用户确认契约时，主会话**必须**同步写入/更新会话 Artifact 目录下的 `<ArtifactDir>/harness_plan.md`，设置 `ArtifactMetadata: { UserFacing: true, RequestFeedback: true, Summary: "..." }`（内含核心假设、契约/计划摘要及指向 `.artifacts/SPEC.md` 与 `.artifacts/PLAN.md` 的可点击 `file://` 链接），随后**立即停止本轮工具调用（后续调用 0 个工具）**，等待用户点击 **Proceed** 按钮（或在纯 CLI 终端回复批准）。
-- **每次修改契约强制重审（Every-Edit Re-Confirmation）**：无论在方案初拟、红队收敛、施工中途遇阻还是审校返工阶段，**只要对 `.artifacts/SPEC.md` 或 `.artifacts/PLAN.md` 进行了除勾选完成状态（`- [x]` 或 `Status:`）以外的任何实质修改，必须同步更新 `<ArtifactDir>/harness_plan.md`（`RequestFeedback: true`）并立即停轮等待用户重新点击确认**。`.agents/hooks.json` 挂载的 `PreToolUse` 物理门禁（`scripts/harness-approval-gate.sh`）会自动硬阻断任何修改契约后未经用户下一轮确认即调起 `slice-builder` 或 `swarm` 的行为。
+- **原生 `Proceed` 审批卡片机制**：工作区 `.artifacts/{SPEC,CONSTRAINTS,PLAN}.md` 是供 Git 版本管理与子智能体读取的唯一磁盘真源（Disk SSoT）。需要用户拍板时，主会话**必须**同步写入/更新 `<ArtifactDir>/harness_plan.md`，设置 `ArtifactMetadata: { UserFacing: true, RequestFeedback: true, Summary: "..." }`（内含核心目标、边界、方案摘要及指向 `.artifacts/SPEC.md` 与 `.artifacts/PLAN.md` 的 `file://` 链接），随后**立即停轮（后续调用 0 个工具）**等待用户点击 **Proceed**（或在纯 CLI 终端回复批准）。
+- **核心契约改必重审 & 非契约备注免重锁（Contract-Only Re-Confirmation）**：
+  - 用户确认需求与方案完全符合后，**只有对核心契约（目标 Goal、非目标 Non-Goals、接口契约 Interface、验收标准 AC 或任务范围变更）做实质修改时，才必须重新更新 `<ArtifactDir>/harness_plan.md`（`RequestFeedback: true`）并停轮重审**。
+  - 以下更新**免重审，直接推进施工**：
+    1. 进度勾选（`- [x]`、`Status:`、`状态:`）；
+    2. 在 `.artifacts/PLAN.md` 的 `## Implementation Notes / Guardrails` 章节（或 `<!-- non-contract --> ... <!-- /non-contract -->` 区块）内补充 `arch-redteam` 非阻断性风险提示（`[RISK-NOTE]`）、边界测试用例或实施备注（前提：不推翻已批准的目标、范围与公共接口）。
+- **物理双门禁守护**：`.agents/hooks.json` 同时挂载 `scripts/harness-approval-gate.sh`（阻止未获确认前启动 `slice-builder` / `swarm`）与 `scripts/harness-source-edit-guard.sh`（契约已激活或超 `Tier S` 阈值时物理阻止主会话直改源码与单测）。
 
-## 2. 任务分级预算阀门与确认节奏（Tier S / M / L / XL）
+## 2. 自适应任务分级与流水线（Tier S / M / L / XL）
 
-接到开发、重构或复杂排错任务时，先按影响范围判定档位并声明所选流水线：
+接到开发、重构或排错任务时，先通过原生并行检索摸底判定档位并沿对应轨道推进（**严禁调用 CRG / `agy-code-graph`**：`read_file`、`grep_search`、`find_by_name` 与 `git` 实测速度更快且零索引错位风险）：
 
-- **Tier S（轻量直通：单文件 Bug 修复、文案样式微调、小于 50 行确定性改动 —— 0 次契约弹窗）**
-  - 主会话直接遵循 `agy-harness:debugging-and-error-recovery` 或 `agy-harness:test-driven-development` 修改 → 执行 `bash scripts/gate-check.sh` → 通过即交付（唤醒 0 个审核 Subagent）。
+- **Tier S（快车道：总改动 `<= 3` 个文件（含测试）、`<= 150` 行、无公共接口破坏与高敏风险 —— 0 弹窗、0 子智能体）**
+  - 前提：`.artifacts/SPEC.md` 与 `.artifacts/PLAN.md` 仍未激活（保持初始模板状态）。
+  - 主会话直接阅读相关文件 → 遵循 TDD 编写/更新测试与实现 → 运行定向单测与 `bash scripts/gate-check.sh` → 通过即交付（不写 `.artifacts/`、不弹 `Proceed`、不唤醒 Subagent）。
 
-- **Tier M（标准单链路特性：跨 2～6 个文件的常规功能开发或重构 —— 合并 1 次点击 `Proceed`）**
-  1. 派发 `invoke_subagent(TypeName: "repo-scout")` 只读检索代码与官方文档，将精简摘要落盘至 `.artifacts/context-brief.md`；
-  2. 主会话遵循 `agy-harness:spec-driven-development`、`agy-harness:constraint-driven-development`、`agy-harness:planning-and-task-breakdown`（需求模糊时先调 `agy-harness:interview-me`）起草 `.artifacts/SPEC.md`、`.artifacts/CONSTRAINTS.md`、`.artifacts/PLAN.md`；
-  3. **【人工确认门禁 #1（合并确认 SPEC + PLAN）】**：同步更新 `<ArtifactDir>/harness_plan.md`（`RequestFeedback: true`），**立即停轮等待用户点击 `Proceed`**（严禁在同一轮直接派发 `slice-builder`）；
-  4. 用户批准后，按切片顺序派发 `invoke_subagent(TypeName: "slice-builder")` 执行 TDD 实现并跑绿 `bash scripts/gate-check.sh`（切片间仅更新 `[x]` / `Status` 进度无需重审；若实质修改 `SPEC.md` 或 `PLAN.md` 则必须回到步骤 3 重新确认）；
-  5. 派发只读 `invoke_subagent(TypeName: "staff-gatekeeper")` 基于 `.artifacts/SPEC.md` 与 `git diff` 终审。
+- **Tier M（标准流：常规跨文件功能或重构 —— 先对齐 1 次 `Proceed`，弹性闭环施工，按需终审）**
+  1. **原生并行摸底**：主会话直接并行 `read_file` / `grep_search` / `find_by_name` 摸清现状并写出精简 `.artifacts/context-brief.md`（严禁冷启动额外探测子代理；仅超大型陌生外网/跨仓库调研才按需用内置 `research`）。
+  2. **先对齐需求与方案（1 次 `Proceed`）**：主会话基于 `.artifacts/` 模板起草精简的 `.artifacts/SPEC.md` 与 `.artifacts/PLAN.md`（仅需求歧义时调 `agy-harness:interview-me`）。同步更新 `<ArtifactDir>/harness_plan.md`（`RequestFeedback: true`），**立即停轮等待用户点击 `Proceed` 确认需求与核心方案完全符合**。
+  3. **弹性 `slice-builder` 闭环施工**：
+     - 共享同一上下文、强耦合的改动默认合并为一个内聚 Slice；仅在存在天然阶段边界时分拆 `Slice 1`、`Slice 2`。
+     - 派发 `invoke_subagent(TypeName: "slice-builder", ...)` 完成 TDD 实现、过程快检与门禁修复；任何返工或收尾微调（**严禁主会话直接动手修改源码**）均在当前 Slice 闭环内通过 `send_message(Recipient: "<conversationId>", Message: "...")` 原地唤醒同一 `slice-builder` 完成。
+  4. **门禁与比对交付**：跑通全量 `bash scripts/gate-check.sh`；改动 `> 150` 行、逻辑复杂或命中风险路径时，唤醒 4 合 1 `staff-gatekeeper` 复核 `GO`；确认清场后交付。
 
-- **Tier L（高危/核心架构：新模块从 0 到 1、公共 API 契约变更、鉴权/资金/核心性能路径 —— 分 2 次点击 `Proceed`）**
-  1. `repo-scout` 取证落盘 `.artifacts/context-brief.md` → 主会话起草 `.artifacts/SPEC.md` 与 `.artifacts/CONSTRAINTS.md`；
-  2. **【人工确认门禁 #1（先批 SPEC 需求与边界）】**：同步渲染 `<ArtifactDir>/harness_plan.md`（`RequestFeedback: true`，聚焦目标、非目标与接口边界），**立即停轮等待用户第 1 次点击 `Proceed`**；
-  3. 用户批准 `SPEC.md` 后，主会话起草 `.artifacts/PLAN.md`，并**必须**先派发只读 `invoke_subagent(TypeName: "arch-redteam")` 执行最多 1 轮空白上下文事前对抗收敛，修复所有 `[BLOCKER]`；
-  4. **【人工确认门禁 #2（再批红队收敛后的 PLAN）】**：更新 `<ArtifactDir>/harness_plan.md`（`RequestFeedback: true`，附上切片划分与红队修正点），**立即停轮等待用户第 2 次点击 `Proceed`**；
-  5. 用户二次批准后，派发 `slice-builder` 施工并通过 `bash scripts/gate-check.sh`，随后并行扇出 `staff-gatekeeper` 与 `risk-specialist` 会审。
+- **Tier L（高危/核心架构：新模块从 0 到 1、公共 API 契约变更、鉴权/资金/并发/核心性能路径 —— 先对齐 1 次 `Proceed`，确认后校验，按 Slice 闭环强审）**
+  1. **原生摸底与需求方案对齐（第 1 次 `Proceed`）**：主会话原生检索起草 `.artifacts/{context-brief,SPEC,PLAN}.md` → 同步 `<ArtifactDir>/harness_plan.md`（`RequestFeedback: true`），**先停轮等待用户点击 `Proceed` 确认需求与核心方案完全符合**。
+  2. **确认后执行架构红队校验（无 `[BLOCKER]` 不打断）**：用户批准后，派发只读 `invoke_subagent(TypeName: "arch-redteam")` 在空白上下文对已定方案执行 1 轮对抗校验：
+     - 仅产出 `[RISK-NOTE]` 时：追加至 `.artifacts/PLAN.md` 的 `## Implementation Notes / Guardrails`（免重审），**立即 `manage_subagents(Action="kill")` 销毁 `arch-redteam`**，直接进入 Slice 1；
+     - 仅当发现必须推翻原方案或修改公共契约的 `[BLOCKER]` 时，销毁 `arch-redteam` 后修订契约并重新发起 `RequestFeedback: true` 确认。
+  3. **按 Slice 闭环施工与 4 合 1 终审**：每个 Slice 独立闭环执行 TDD `slice-builder` → 全量 `bash scripts/gate-check.sh` → 4 合 1 `staff-gatekeeper`（同时审计质量、精简、反假测试与鉴权/外部输入/SQL/依赖/CWV/热点循环风险）直至 `GO`，随后 `kill` 本 Slice 全部子智能体再进入下一 Slice。
 
-- **Tier XL（跨模块正交大工程：触及 >= 3 个互不共享可写文件的独立子目录/子系统 —— 分 2 次点击 `Proceed` + 并发分片）**
-  1. **【人工确认门禁 #1（先批跨模块 SPEC）】**：`repo-scout` 取证 → 主会话落盘 `.artifacts/SPEC.md` 与 `CONSTRAINTS.md`（含模块能力边界）→ 同步 `<ArtifactDir>/harness_plan.md`（`RequestFeedback: true`）并**停轮等待第 1 次点击 `Proceed`**；
-  2. **【红队锁契约 + 人工确认门禁 #2（再批独占文件子树 PLAN）】**：起草 `.artifacts/PLAN.md`（必须为每个 Slice 显式划定独占可写文件子树，严禁两个并发 Worker 写同一文件）→ 经 `arch-redteam` 锁死跨模块接口契约 → 更新 `<ArtifactDir>/harness_plan.md`（`RequestFeedback: true`）并**停轮等待第 2 次点击 `Proceed`**；
-  3. **并行分片施工（二次获批后二选一）**：
-     - **默认省钱引擎（XL-A，契约已锁死无需跨端互聊）**：并发调用多个 `invoke_subagent(TypeName: "slice-builder", Workspace: "share")`，各自在独立工作树完成切片并跑通 `bash scripts/gate-check.sh`，主会话合并后统一交 `staff-gatekeeper`（及按需 `risk-specialist`）终审；
-     - **协同黑板引擎（XL-B，实现期需跨端实时对齐细节或用户指定 `/swarm`）**：调用内置 `swarm` 技能，按 `PLAN.md` 文件子树建立 `workspace: "share"` 的 Author Workers 与只读 Verifier Worker，在 Brief 中规定必须先跑绿 `bash scripts/gate-check.sh` 才允许 `@verifier` 提审，全程用 `#seq` 消息序号传参。
+- **Tier XL（跨模块正交大工程：触及 `>= 3` 个互不共享可写文件的独立子目录/子系统 —— 先对齐后校验 + 并发分片）**
+  1. **对齐与校验节奏同 Tier L**：主会话起草跨模块 `SPEC.md` 与独占文件子树 `PLAN.md` → **先停轮等待用户 1 次 `Proceed` 确认需求与模块边界完全符合** → 唤起 `arch-redteam` 校验跨模块接口与文件子树冲突（落地后立即 `kill`）。
+  2. **并行分片施工（二选一）**：
+     - **默认引擎（XL-A，契约已锁死无需跨端互聊）**：并发调用多个 `invoke_subagent(TypeName: "slice-builder", Workspace: "share")` 完成各自独占子树与局部快检，主会话合并后统一跑全量 `bash scripts/gate-check.sh` 并交 4 合 1 `staff-gatekeeper` 终审，彻底 `GO` 后全员 `kill`；
+     - **协同黑板引擎（XL-B，实现期需跨端实时对齐细节或用户指定 `/swarm`）**：调用内置 `swarm` 技能，按 `PLAN.md` 文件子树建立 `workspace: "share"` 的 Author Workers 与只读 Verifier Worker，在 Brief 中规定先跑绿本地快检与 `bash scripts/gate-check.sh` 才允许 `@verifier` 提审，全程用 `#seq` 消息序号传参。
 
-## 3. 条件风险触发规则（`risk-specialist` 唤醒条件）
+## 3. 按 Slice 闭环常驻与过关清场生命周期（Per-Slice Closed-Loop Lifecycle）
 
-当 `git diff` 触及以下任一边界时（无论 Tier M / L / XL），在 `scripts/gate-check.sh` 通过后必须唤醒 `risk-specialist`：
-- 登录鉴权、Session/Cookie/Token、RBAC 权限校验；
-- 外部不可信输入解析、SQL/ORM 原生查询、Shell/文件上传、新增第三方依赖；
-- 首屏关键渲染路径（CWV）、高频循环、大数据量列表查询或并发锁。
+1. **红队独立瞬态**：`arch-redteam` 在产出结论并写入 `.artifacts/PLAN.md` 的 `## Implementation Notes / Guardrails` 后**立刻 `manage_subagents(Action="kill")` 销毁**，绝不留存至施工阶段。
+2. **Slice 闭环内零销毁、原地唤醒复用**：Slice `N` 创建的 `slice-builder` 与 `staff-gatekeeper` 在本 Slice 施工、本地门禁报错修复、`NO-GO` 打回返工、`[HOST_CMD_REQUEST]` 宿主机代跑及用户追问微调期间**严禁销毁重建**，必须一律调用 **`send_message(Recipient: "<conversationId>", Message: "...")`** 原地唤醒既有实例续作（消除冷启动上下文丢弃与高额重复读代码开销）。
+3. **过关即刻清场 → 下一 Slice 全新重建**：当且仅当 Slice `N` 的全部修改、测试与门禁/终审（`GO`）完全过关后，在推进到 Slice `N + 1` 或最终交付前，**必须立即调用 `manage_subagents(Action="kill", ConversationIds=[...])` 销毁 Slice `N` 的全部 subagents**，再更新 `PLAN.md` 对应切片状态为 `[x]`，并为 Slice `N + 1` 启动全新空白上下文子智能体（杜绝跨 Slice 上下文腐烂）。
+4. **交付清零校验**：最终汇报交付前必须调用 `manage_subagents(Action="list")` 确认当前工作区已无残留运行中的 subagent（数量为 `0`）。
 
 ## 4. 上下文卫生、宿主机代跑与防死循环熔断铁律
 
-1. **零历史粘贴传参（Tier XL 传绝对路径）**：调用任何 `invoke_subagent` 或 `swarm` 时，Prompt/Brief 中只允许传递 `.artifacts/` 下的契约文件路径、目标 Slice 编号及精准修改指令，严禁粘贴长篇对话历史。由于 `.artifacts/` 已默认加入 `.gitignore`，在 Tier XL 使用 `Workspace: "share"` 或 `swarm(workspace: "share")` 独立工作树时，**必须传递主工作区 `.artifacts/` 契约文件的绝对路径**，确保子工作树可直接读取同一份真源。
-2. **宿主机重型命令代跑与原地唤醒（`[HOST_CMD_REQUEST]` ↔ `send_message` 闭环）**：子智能体仅允许自跑 `<= 5` 秒（硬上限 10 秒）的纯本地无网短命令；一旦子智能体输出 `## [HOST_CMD_REQUEST]` 挂起请求（如 `docker` / `docker compose`、外网装包、常驻服务或 `> 10` 秒重型门禁），主会话必须在顶层宿主环境按请求指定的 `cwd` 绝对路径（含 Tier XL `Workspace: "share"` 独立子工作树）代跑该非交互命令（容器启动优先使用 `docker compose up -d --wait` 等非阻塞参数），提取退出码与精简关键日志（`<= 50` 行），调用 **`send_message(Recipient: "<conversationId>", Message: "...")`** 原地唤醒原子智能体恢复上下文继续施工或审校（**严禁**为同一施工切片销毁重开全新的 `invoke_subagent`；同一切片因报错委托修复上限 `<= 2` 轮）。
-3. **两轮熔断上限（Max Retries = 2）**：仅 `[BLOCKER]` 或 `[CRITICAL]` 允许打回 `slice-builder` 返工，最多自动循环 **2 轮**；若返工需要变更 `SPEC.md` 或 `PLAN.md` 的接口/范围，必须先暂停向用户重新发起 `RequestFeedback: true` 确认；若第 2 轮审校仍为 `NO-GO`，立即停止自动重试并向用户呈现分歧点。`[NIT]` 与风格建议一律记录到汇总报告交由用户决定，禁止触发自动重编译循环。
-4. **交付收口**：终审放行 `GO` 后，主会话遵循 `agy-harness:git-workflow-and-versioning`（必要时配合 `agy-harness:shipping-and-launch`）完成交付。
+1. **零历史粘贴传参（Tier XL 传绝对路径）**：调用 `invoke_subagent` 或 `swarm` 时，Prompt/Brief 仅允许传递 `.artifacts/` 契约文件路径、当前 Slice 目标范围与精准指令，严禁粘贴长篇对话历史；在 Tier XL `Workspace: "share"` 独立工作树下**必须传递主工作区 `.artifacts/` 契约文件的绝对路径**。
+2. **宿主机重型命令代跑与原地唤醒（`[HOST_CMD_REQUEST]` ↔ `send_message` 闭环）**：子智能体仅允许自跑 `<= 5` 秒（硬上限 10 秒）的纯本地无网短命令（建议过程自检用定向单测或 `bash scripts/gate-check.sh --fast`）；一旦输出 `## [HOST_CMD_REQUEST]` 挂起请求（如 `docker` / `docker compose`、外网装包、常驻服务或 `> 10` 秒重型门禁），主会话必须在顶层宿主环境按请求指定的 `cwd` 绝对路径（含独立子工作树）代跑该非交互命令，提取退出码与精简关键日志（`<= 50` 行），调用 **`send_message(Recipient: "<conversationId>", Message: "...")`** 原地唤醒原子智能体继续工作（**严禁**销毁重开新 subagent；同一报错委托修复上限 `<= 2` 轮）。
+3. **单点返工两轮熔断上限（Max Retries = 2）**：同一阻塞点（`[BLOCKER]` 或 `[CRITICAL]`）在 Slice 闭环内通过 `send_message` 打回 `slice-builder` 自动返工最多 **2 轮**；若返工需要变更 `SPEC.md` / `PLAN.md` 核心接口或范围，必须先更新 `<ArtifactDir>/harness_plan.md`（`RequestFeedback: true`）停轮重审；若第 2 轮审校仍为 `NO-GO`，立即停止自动重试并向用户呈现分歧点。`[NIT]` 与非阻断建议一律记入报告，禁止触发自动返工循环。
+4. **交付收口**：全部 Slice 清场与终审放行后，跑通全量 `bash scripts/gate-check.sh`，按需遵循 `agy-harness:git-workflow-and-versioning`（涉及发布时配合 `agy-harness:shipping-and-launch`）完成交付。
