@@ -28,12 +28,14 @@ PUBLIC_PORT = 8090
 
 GEMINI_EXE = os.path.join(BASE_DIR, "gemini-web2api.exe")
 GEMINI_COOKIE_FILE = os.path.join(BASE_DIR, "cookie.txt")
+DEEPSEEK_EXE = os.path.join(BASE_DIR, "deepseek_server.exe")
 DEEPSEEK_SERVER_PY = os.path.join(BASE_DIR, "deepseek_server.py")
 DEEPSEEK_TOKEN_FILE = os.path.join(BASE_DIR, "deepseek_token.txt")
 DEEPSEEK_VENV_PYTHON = os.path.join(BASE_DIR, "deepseek_venv", "Scripts", "python.exe")
 if not os.path.exists(DEEPSEEK_VENV_PYTHON):
     DEEPSEEK_VENV_PYTHON = sys.executable
 
+GATEWAY_EXE = os.path.join(BASE_DIR, "gateway_server.exe")
 GATEWAY_SERVER_PY = os.path.join(BASE_DIR, "gateway_server.py")
 CONFIG_FILE = os.path.join(BASE_DIR, "settings_config.json")
 APP_ICON = os.path.join(BASE_DIR, "app.ico")
@@ -417,10 +419,17 @@ class UnifiedServiceCard(ModernCard):
             threading.Thread(target=lambda: self.stream_logs(self.proc_gemini, "Gemini核心"), daemon=True).start()
 
             # 2. 启动内部 DeepSeek 核心 (8087)
-            if os.path.exists(DEEPSEEK_SERVER_PY):
+            if os.path.exists(DEEPSEEK_EXE):
+                cmd_deepseek = [DEEPSEEK_EXE, str(INTERNAL_DEEPSEEK_PORT)]
+            elif os.path.exists(DEEPSEEK_SERVER_PY):
                 ds_python = DEEPSEEK_VENV_PYTHON if os.path.exists(DEEPSEEK_VENV_PYTHON) else sys.executable
+                cmd_deepseek = [ds_python, DEEPSEEK_SERVER_PY, str(INTERNAL_DEEPSEEK_PORT)]
+            else:
+                cmd_deepseek = None
+
+            if cmd_deepseek:
                 self.proc_deepseek = subprocess.Popen(
-                    [ds_python, DEEPSEEK_SERVER_PY, str(INTERNAL_DEEPSEEK_PORT)],
+                    cmd_deepseek,
                     cwd=BASE_DIR,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
@@ -432,17 +441,25 @@ class UnifiedServiceCard(ModernCard):
                 threading.Thread(target=lambda: self.stream_logs(self.proc_deepseek, "DeepSeek核心"), daemon=True).start()
 
             # 3. 启动对外统一网关 (8090)
-            self.proc_gateway = subprocess.Popen(
-                [python_exe, GATEWAY_SERVER_PY, str(PUBLIC_PORT)],
-                cwd=BASE_DIR,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                creationflags=creationflags,
-                encoding="utf-8",
-                errors="replace"
-            )
-            threading.Thread(target=lambda: self.stream_logs(self.proc_gateway, "Gemini智能网关"), daemon=True).start()
+            if os.path.exists(GATEWAY_EXE):
+                cmd_gateway = [GATEWAY_EXE, str(PUBLIC_PORT)]
+            elif os.path.exists(GATEWAY_SERVER_PY):
+                cmd_gateway = [python_exe, GATEWAY_SERVER_PY, str(PUBLIC_PORT)]
+            else:
+                cmd_gateway = None
+
+            if cmd_gateway:
+                self.proc_gateway = subprocess.Popen(
+                    cmd_gateway,
+                    cwd=BASE_DIR,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    creationflags=creationflags,
+                    encoding="utf-8",
+                    errors="replace"
+                )
+                threading.Thread(target=lambda: self.stream_logs(self.proc_gateway, "Gemini智能网关"), daemon=True).start()
 
             self.sync_ui_status(True)
             self.main_win.append_log(f"[服务管理] Web2API 双引擎反代服务已启动！统一监听端口: {PUBLIC_PORT} (Gemini: {INTERNAL_GEMINI_PORT} | DeepSeek: {INTERNAL_DEEPSEEK_PORT})")

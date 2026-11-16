@@ -13,7 +13,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 from curl_cffi.requests import AsyncSession
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_FILE = os.path.join(BASE_DIR, "deepseek_token.txt")
 WASM_FILE = os.path.join(BASE_DIR, "sha3_wasm_bg.wasm")
 ENV_FILE = os.path.join(BASE_DIR, ".env")

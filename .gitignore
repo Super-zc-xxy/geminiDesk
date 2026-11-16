@@ -7,9 +7,12 @@
 __pycache__/
 *.pyc
 *.exe
+*.spec
 build/
 dist/
 *venv/
+*-Portable/
+*.zip
 
 # Sensitive tokens & cookies
 cookie.txt*

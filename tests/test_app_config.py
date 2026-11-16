@@ -141,8 +141,8 @@ class TestAppConfigAndDeepSeekIntegration(unittest.TestCase):
 
             # 验证启动了 DeepSeek 进程
             self.assertIsNotNone(card.proc_deepseek)
-            deepseek_cmd = next((c for c in popen_cmds if any("deepseek_server.py" in str(arg) for arg in c)), None)
-            self.assertIsNotNone(deepseek_cmd, "必须通过 Popen 启动 deepseek_server.py")
+            deepseek_cmd = next((c for c in popen_cmds if any("deepseek_server" in str(arg) for arg in c)), None)
+            self.assertIsNotNone(deepseek_cmd, "必须通过 Popen 启动 deepseek_server (exe 或 py)")
             self.assertIn("8087", [str(arg) for arg in deepseek_cmd])
 
     def test_stop_service_terminates_deepseek(self):
