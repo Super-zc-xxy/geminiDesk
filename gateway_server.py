@@ -195,6 +195,45 @@ async def list_models():
         "data": [{"id": m, "object": "model", "created": now, "owned_by": "web2api-hub"} for m in sorted_models]
     }
 
+# ================= 兼容第三方 IDE/插件向量端点 (/v1/embeddings) =================
+@app.post("/v1/embeddings")
+@app.post("/v1/embeddings/")
+@app.post("/embeddings")
+@app.post("/embeddings/")
+async def create_embeddings(request: Request):
+    """为 Continue / Aider / Cursor / 知识库插件提供 OpenAI 兼容的向量端点兜底"""
+    body = await request.json()
+    model = body.get("model", "text-embedding-ada-002")
+    input_data = body.get("input", "")
+    if isinstance(input_data, str):
+        items = [input_data]
+    elif isinstance(input_data, list):
+        items = input_data
+    else:
+        items = [""]
+
+    dummy_vec = [0.001 * ((i % 10) - 5) for i in range(768)]
+    data = []
+    total_tokens = 0
+    for idx, item in enumerate(items):
+        item_len = len(str(item))
+        total_tokens += max(1, item_len // 4)
+        data.append({
+            "object": "embedding",
+            "index": idx,
+            "embedding": dummy_vec
+        })
+
+    return {
+        "object": "list",
+        "data": data,
+        "model": model,
+        "usage": {
+            "prompt_tokens": total_tokens,
+            "total_tokens": total_tokens
+        }
+    }
+
 async def call_backend_stream(messages: list, target_model: str):
     engine = resolve_backend_engine(target_model)
     port = get_engine_port(engine)
@@ -493,6 +532,9 @@ async def chat_completions(request: Request):
                 error_body = await resp.aread()
                 await resp.aclose()
                 await client.aclose()
+                if resp.status_code in (401, 403):
+                    friendly_msg = f"【{engine_name} 凭据异常 {resp.status_code}】：网页登录凭据可能已失效或过期，请在 Web2API 桌面中心更新 Cookie/Token！\n详情: {error_body.decode('utf-8', errors='ignore')}"
+                    return JSONResponse({"error": {"message": friendly_msg, "code": resp.status_code}}, status_code=resp.status_code)
                 return Response(error_body, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
             
             async def stream_generator():
@@ -599,6 +641,9 @@ async def chat_completions(request: Request):
                                 return JSONResponse(res_json, status_code=200)
                     except Exception:
                         pass
+                elif resp.status_code in (401, 403):
+                    friendly_msg = f"【{engine_name} 凭据异常 {resp.status_code}】：网页登录凭据可能已失效或过期，请在 Web2API 桌面中心更新 Cookie/Token！\n详情: {resp.text}"
+                    return JSONResponse({"error": {"message": friendly_msg, "code": resp.status_code}}, status_code=resp.status_code)
                 return Response(
                     content=resp.content,
                     status_code=resp.status_code,

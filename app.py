@@ -86,6 +86,19 @@ def set_autostart(enable: bool):
     except Exception as e:
         print("设置自启动失败:", e)
 
+def check_and_update_autostart_path():
+    """便携版换目录运行后，若先前启用了开机自启，自动自愈校准为当前实际路径"""
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
+        value, _ = winreg.QueryValueEx(key, "Web2API-Hub")
+        winreg.CloseKey(key)
+        exe_path = os.path.join(BASE_DIR, "Web2API-Hub.exe")
+        expected_val = f'"{exe_path}"'
+        if value != expected_val and os.path.exists(exe_path):
+            set_autostart(True)
+    except Exception:
+        pass
+
 def is_port_open(port):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -97,11 +110,50 @@ def is_port_open(port):
 def kill_port_owner(port):
     if sys.platform != "win32":
         return
+    # 如果端口本来就未被占用，直接跳过，避免拉起 PowerShell 导致 1-3 秒的 UI 响应卡顿
+    if not is_port_open(port):
+        return
     try:
         cmd = f'powershell -NoProfile -Command "$c = Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue; if ($c) {{ Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue }}"'
         subprocess.run(cmd, shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
     except Exception:
         pass
+
+def detect_local_proxy() -> str:
+    """
+    智能自适应探测本机可用代理：
+    1. 优先读取 Windows 注册表系统代理 (Internet Settings -> ProxyEnable / ProxyServer)
+    2. 轮询常见代理客户端默认监听端口: 7890(Clash), 7897(Clash Verge), 10809(v2rayN HTTP), 10808(v2rayN SOCKS), 1080(SS), 8080
+    3. 检查环境变量 HTTP_PROXY / HTTPS_PROXY
+    若无可用代理则返回空字符串。
+    """
+    if sys.platform == "win32":
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Internet Settings", 0, winreg.KEY_READ)
+            enable, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            server, _ = winreg.QueryValueEx(key, "ProxyServer")
+            winreg.CloseKey(key)
+            if enable and server:
+                if "=" in server:
+                    for part in server.split(";"):
+                        if part.startswith("http=") or part.startswith("https="):
+                            addr = part.split("=", 1)[1]
+                            return addr if addr.startswith("http") else f"http://{addr}"
+                else:
+                    return server if server.startswith("http") else f"http://{server}"
+        except Exception:
+            pass
+
+    common_ports = [7890, 7897, 10809, 10808, 1080, 8080]
+    for p in common_ports:
+        if is_port_open(p):
+            return f"http://127.0.0.1:{p}"
+
+    env_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    if env_proxy:
+        return env_proxy
+
+    return ""
 
 class LogEmitter(QObject):
     new_log = pyqtSignal(str)
@@ -392,18 +444,23 @@ class UnifiedServiceCard(ModernCard):
         time.sleep(0.3)
 
         try:
+            self.desired_running = True
             # 1. 启动内部 Gemini 核心 (8085)
             cmd_gemini = [GEMINI_EXE, "-port", str(INTERNAL_GEMINI_PORT)]
             if os.path.exists(GEMINI_COOKIE_FILE) and os.path.getsize(GEMINI_COOKIE_FILE) > 0:
                 cmd_gemini.extend(["-cookie-file", "cookie.txt"])
 
             gemini_env = os.environ.copy()
-            if is_port_open(7890):
-                gemini_env["http_proxy"] = "http://127.0.0.1:7890"
-                gemini_env["https_proxy"] = "http://127.0.0.1:7890"
-                gemini_env["HTTP_PROXY"] = "http://127.0.0.1:7890"
-                gemini_env["HTTPS_PROXY"] = "http://127.0.0.1:7890"
-                cmd_gemini.extend(["-proxy", "http://127.0.0.1:7890"])
+            detected_proxy = detect_local_proxy()
+            if detected_proxy:
+                gemini_env["http_proxy"] = detected_proxy
+                gemini_env["https_proxy"] = detected_proxy
+                gemini_env["HTTP_PROXY"] = detected_proxy
+                gemini_env["HTTPS_PROXY"] = detected_proxy
+                cmd_gemini.extend(["-proxy", detected_proxy])
+                self.main_win.append_log(f"[网络代理] 自动识别并挂载可用代理: {detected_proxy}")
+            else:
+                self.main_win.append_log("[网络代理] 未探测到本地代理，Gemini 将采用直连模式 (访问 Google 请开启梯子)")
 
             self.proc_gemini = subprocess.Popen(
                 cmd_gemini,
@@ -477,6 +534,7 @@ class UnifiedServiceCard(ModernCard):
                 time.sleep(0.1)
 
     def stop_service(self):
+        self.desired_running = False
         if self.proc_gateway:
             self.proc_gateway.terminate()
             try:
@@ -545,6 +603,7 @@ class MainWindow(QMainWindow):
         self.log_emitter.new_log.connect(self.add_log_text)
 
         self.load_config()
+        check_and_update_autostart_path()
         self.init_ui()
         self.init_tray()
 
@@ -560,6 +619,20 @@ class MainWindow(QMainWindow):
     def check_service_health(self):
         running = self.card_service.is_running()
         self.card_service.sync_ui_status(running)
+        if hasattr(self.card_service, "desired_running") and self.card_service.desired_running:
+            # 看门狗检测子进程意外退出并自动恢复
+            c = self.card_service
+            dead_core = None
+            if c.proc_gateway and c.proc_gateway.poll() is not None:
+                dead_core = "智能网关"
+            elif c.proc_gemini and c.proc_gemini.poll() is not None:
+                dead_core = "Gemini核心"
+            elif c.proc_deepseek and c.proc_deepseek.poll() is not None:
+                dead_core = "DeepSeek核心"
+
+            if dead_core:
+                self.append_log(f"[看门狗告警] ⚠️ 检测到 {dead_core} 意外退出 (已捕获)，正在为您自动拉起守护...")
+                c.start_service()
 
     def load_config(self):
         if os.path.exists(CONFIG_FILE):
@@ -743,11 +816,16 @@ class MainWindow(QMainWindow):
                 pass
         g_layout.addWidget(self.edit_gemini_cookie)
 
+        btn_test_g = QPushButton("⚡ 测试 Cookie 有效性")
+        btn_test_g.setStyleSheet("background-color: #f1f5f9; border: 1px solid #cbd5e1; color: #334155; font-weight: bold; padding: 6px 14px; border-radius: 6px;")
+        btn_test_g.clicked.connect(self.test_gemini_cookie)
+
         btn_save_g = QPushButton("保存 Gemini 凭据")
         btn_save_g.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold; padding: 6px 16px; border-radius: 6px;")
         btn_save_g.clicked.connect(self.save_gemini_cookie)
         g_btn_row = QHBoxLayout()
         g_btn_row.addStretch()
+        g_btn_row.addWidget(btn_test_g)
         g_btn_row.addWidget(btn_save_g)
         g_layout.addLayout(g_btn_row)
 
@@ -770,11 +848,16 @@ class MainWindow(QMainWindow):
                 pass
         d_layout.addWidget(self.edit_deepseek_token)
 
+        btn_test_d = QPushButton("⚡ 测试 Token 有效性")
+        btn_test_d.setStyleSheet("background-color: #f1f5f9; border: 1px solid #cbd5e1; color: #334155; font-weight: bold; padding: 6px 14px; border-radius: 6px;")
+        btn_test_d.clicked.connect(self.test_deepseek_token)
+
         btn_save_d = QPushButton("保存 DeepSeek 凭据")
         btn_save_d.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold; padding: 6px 16px; border-radius: 6px;")
         btn_save_d.clicked.connect(self.save_deepseek_token)
         d_btn_row = QHBoxLayout()
         d_btn_row.addStretch()
+        d_btn_row.addWidget(btn_test_d)
         d_btn_row.addWidget(btn_save_d)
         d_layout.addLayout(d_btn_row)
 
@@ -892,6 +975,96 @@ class MainWindow(QMainWindow):
             self.append_log("[配置保存] DeepSeek Token 凭据已成功写入 deepseek_token.txt。")
         except Exception as e:
             QMessageBox.critical(self, "保存失败", f"写入失败：{e}")
+
+    def test_gemini_cookie(self):
+        cookie_text = self.edit_gemini_cookie.toPlainText().strip()
+        if not cookie_text:
+            QMessageBox.warning(self, "提示", "请先在上方输入框粘贴 Gemini Cookie 内容！")
+            return
+        self.append_log("[凭据检测] 正在验证 Gemini Cookie 格式与网络连接...")
+        has_sid = "__Secure-1PSID" in cookie_text or "SID=" in cookie_text or "__Secure-3PSID" in cookie_text
+        if not has_sid:
+            QMessageBox.warning(
+                self, "Cookie 校验不完整",
+                "未在 Cookie 中检测到 Google 登录关键标识 (__Secure-1PSID / SID)！\n\n"
+                "请确认已完整复制 gemini.google.com 登录后的 Cookie。"
+            )
+            return
+
+        proxy_url = detect_local_proxy()
+        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+        try:
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            resp = requests.get("https://gemini.google.com/", headers=headers, proxies=proxies, timeout=5)
+            if resp.status_code == 200:
+                QMessageBox.information(
+                    self, "凭据与网络正常 ✓",
+                    f"1. Cookie 格式完整，包含核心凭据字段。\n"
+                    f"2. Google 访问畅通 (检测到网络/代理: {proxy_url or '直连'})。\n\n"
+                    f"请点击【保存 Gemini 凭据】后启动服务即可生效！"
+                )
+            else:
+                QMessageBox.warning(self, "网络异常", f"连接 Google 返回状态码: {resp.status_code}，请检查梯子代理是否正常。")
+        except Exception as e:
+            QMessageBox.warning(
+                self, "网络连接提示",
+                f"Cookie 格式校验通过，但当前无法直接连接到 Google 服务器。\n"
+                f"详情: {e}\n\n"
+                f"提示：访问 Google 需要科学上网，请启动梯子 (Clash/v2rayN 等) 并确保系统代理已开启。"
+            )
+
+    def test_deepseek_token(self):
+        token_text = self.edit_deepseek_token.toPlainText().strip()
+        if not token_text:
+            QMessageBox.warning(self, "提示", "请先在上方输入框粘贴 DeepSeek userToken！")
+            return
+
+        token = ""
+        for line in token_text.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "请在此处" not in line:
+                token = line
+                break
+
+        if not token:
+            QMessageBox.warning(self, "提示", "未能提取到有效的 Token，请检查内容！")
+            return
+
+        self.append_log("[凭据检测] 正在向 DeepSeek 官方 API 验证 userToken 有效性...")
+        try:
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Referer": "https://chat.deepseek.com/",
+                "Origin": "https://chat.deepseek.com"
+            }
+            resp = requests.get("https://chat.deepseek.com/api/v0/users/current", headers=headers, timeout=6)
+            if resp.status_code == 200:
+                res_data = resp.json()
+                code = res_data.get("code")
+                if code == 0:
+                    user_info = res_data.get("data", {})
+                    name = user_info.get("name") or user_info.get("email") or "已认证用户"
+                    QMessageBox.information(
+                        self, "DeepSeek 凭据有效 ✓",
+                        f"验证成功！userToken 正常有效。\n\n"
+                        f"• 当前用户: {name}\n"
+                        f"• 状态: 正常在线\n\n"
+                        f"请点击【保存 DeepSeek 凭据】后启动服务即可生效！"
+                    )
+                else:
+                    msg = res_data.get("msg", "未知原因")
+                    QMessageBox.critical(
+                        self, "凭据已失效",
+                        f"DeepSeek 官方返回鉴权失败：\n{msg}\n\n"
+                        f"说明该 userToken 已过期，请重新登录 chat.deepseek.com 并在 Local Storage 中复制最新的 userToken！"
+                    )
+            elif resp.status_code in (401, 403):
+                QMessageBox.critical(self, "凭据已失效", f"DeepSeek 官方返回 HTTP {resp.status_code}：Token 已失效，请在网页端重新登录获取！")
+            else:
+                QMessageBox.warning(self, "验证返回异常", f"DeepSeek 返回 HTTP {resp.status_code}：{resp.text[:200]}")
+        except Exception as e:
+            QMessageBox.warning(self, "网络异常", f"连接 DeepSeek 服务器失败：{e}")
 
     def toggle_autostart(self):
         curr = is_autostart_enabled()

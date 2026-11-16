@@ -168,5 +168,22 @@ class TestAppConfigAndDeepSeekIntegration(unittest.TestCase):
             self.assertIn(8085, killed_ports)
             self.assertIn(8090, killed_ports)
 
+    def test_kill_port_owner_fast_skip(self):
+        """9. 检查 kill_port_owner 在端口未占用时快速返回不执行 PowerShell"""
+        with patch("app.is_port_open", return_value=False):
+            with patch("subprocess.run") as mock_subproc:
+                app.kill_port_owner(8090)
+                mock_subproc.assert_not_called()
+
+    def test_detect_local_proxy(self):
+        """10. 检查 detect_local_proxy 智能轮询多代理端口"""
+        def mock_is_open(port):
+            return port == 7897  # 模拟 Clash Verge 在 7897 开启
+        with patch("app.is_port_open", side_effect=mock_is_open):
+            with patch("winreg.OpenKey", side_effect=OSError("No registry")):
+                with patch.dict("os.environ", {}, clear=True):
+                    proxy = app.detect_local_proxy()
+                    self.assertEqual(proxy, "http://127.0.0.1:7897")
+
 if __name__ == "__main__":
     unittest.main()

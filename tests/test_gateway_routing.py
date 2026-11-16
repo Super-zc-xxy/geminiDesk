@@ -393,5 +393,65 @@ class TestGatewayRouting(unittest.TestCase):
             self.assertIn("[DONE]", output)
             self.assertTrue(mock_client.is_closed)
 
+    def test_embeddings_endpoint(self):
+        """11. 验证 /v1/embeddings 向量端点提供 OpenAI 兼容的 768 维向量输出"""
+        class DummyRequest:
+            def __init__(self, body):
+                self._body = body
+            async def json(self):
+                return self._body
+
+        req = DummyRequest({
+            "input": ["测试文本1", "测试文本2"],
+            "model": "text-embedding-ada-002"
+        })
+        resp = asyncio.run(gateway_server.create_embeddings(req))
+        self.assertEqual(resp["object"], "list")
+        self.assertEqual(len(resp["data"]), 2)
+        self.assertEqual(len(resp["data"][0]["embedding"]), 768)
+        self.assertEqual(resp["model"], "text-embedding-ada-002")
+
+    def test_chat_completions_401_credential_error(self):
+        """12. 验证后端返回 401/403 凭据失效时，网关返回友好的中文诊断提示"""
+        class DummyRequest:
+            def __init__(self, body):
+                self._body = body
+                self.headers = {}
+            async def json(self):
+                return self._body
+
+        req = DummyRequest({
+            "model": "gemini-4-hydrogen",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True
+        })
+
+        class Mock401Response:
+            status_code = 401
+            headers = {"content-type": "application/json"}
+            async def aread(self):
+                return b'{"error":"unauthorized"}'
+            async def aclose(self):
+                pass
+
+        class MockClient:
+            def __init__(self, *args, **kwargs):
+                self.is_closed = False
+            def build_request(self, method, url, **kwargs):
+                return None
+            async def send(self, req, stream=False):
+                return Mock401Response()
+            async def aclose(self):
+                self.is_closed = True
+
+        mock_client = MockClient()
+        with patch("gateway_server.httpx.AsyncClient", return_value=mock_client):
+            resp = asyncio.run(gateway_server.chat_completions(req))
+            self.assertEqual(resp.status_code, 401)
+            body_dict = json.loads(resp.body.decode("utf-8"))
+            self.assertIn("凭据异常", body_dict["error"]["message"])
+            self.assertIn("网页登录凭据可能已失效或过期", body_dict["error"]["message"])
+            self.assertTrue(mock_client.is_closed)
+
 if __name__ == "__main__":
     unittest.main()
