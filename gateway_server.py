@@ -373,30 +373,42 @@ async def chat_completions(request: Request):
     backend_url = f"http://127.0.0.1:{port}/v1/chat/completions"
     
     body["model"] = target_model
-    headers = {"Authorization": request.headers.get("Authorization", "")} if request.headers.get("Authorization") else {"Content-Type": "application/json"}
+    forward_headers = {"Content-Type": "application/json"}
+    auth_header = request.headers.get("Authorization")
+    if auth_header:
+        forward_headers["Authorization"] = auth_header
 
     if is_stream:
+        client = httpx.AsyncClient(timeout=120.0, trust_env=False)
         try:
-            async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
-                req = client.build_request("POST", backend_url, json=body, headers=headers)
-                resp = await client.send(req, stream=True)
-                if resp.status_code != 200:
-                    error_body = await resp.aread()
-                    return Response(error_body, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
-                
-                async def stream_generator():
-                    try:
-                        async for chunk in resp.aiter_raw():
-                            yield chunk
-                    finally:
-                        await resp.aclose()
-                        
-                return StreamingResponse(
-                    stream_generator(),
-                    status_code=resp.status_code,
-                    media_type="text/event-stream"
-                )
+            req = client.build_request("POST", backend_url, json=body, headers=forward_headers)
+            resp = await client.send(req, stream=True)
+            if resp.status_code != 200:
+                error_body = await resp.aread()
+                await resp.aclose()
+                await client.aclose()
+                return Response(error_body, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
+            
+            async def stream_generator():
+                try:
+                    async for chunk in resp.aiter_raw():
+                        yield chunk
+                finally:
+                    await resp.aclose()
+                    await client.aclose()
+                    
+            return StreamingResponse(
+                stream_generator(),
+                status_code=resp.status_code,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"
+                }
+            )
         except httpx.ConnectError:
+            await client.aclose()
             err_chunk = {
                 "id": f"chatcmpl-err-{uuid.uuid4().hex[:8]}",
                 "object": "chat.completion.chunk",
@@ -411,13 +423,22 @@ async def chat_completions(request: Request):
             async def err_stream():
                 yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
                 yield b"data: [DONE]\n\n"
-            return StreamingResponse(err_stream(), media_type="text/event-stream")
+            return StreamingResponse(
+                err_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"
+                }
+            )
         except Exception as e:
+            await client.aclose()
             return JSONResponse({"error": {"message": f"代理转接异常: {str(e)}"}}, status_code=500)
     else:
         try:
             async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
-                resp = await client.post(backend_url, json=body, headers=headers)
+                resp = await client.post(backend_url, json=body, headers=forward_headers)
                 return Response(
                     content=resp.content,
                     status_code=resp.status_code,

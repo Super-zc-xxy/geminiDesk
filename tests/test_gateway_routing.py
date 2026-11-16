@@ -267,5 +267,58 @@ class TestGatewayRouting(unittest.TestCase):
             self.assertIn("8087", stream_out)
             self.assertIn("[DONE]", stream_out)
 
+    def test_chat_completions_stream_success(self):
+        """9. 验证 /v1/chat/completions 流式模式正常转发并保持连接产出 chunk"""
+        class DummyRequest:
+            def __init__(self, body):
+                self._body = body
+                self.headers = {"Authorization": "Bearer test-key"}
+            async def json(self):
+                return self._body
+
+        req_stream = DummyRequest({
+            "model": "gemini-4-hydrogen",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True
+        })
+
+        class MockStreamResponse:
+            status_code = 200
+            headers = {"content-type": "text/event-stream"}
+            async def aiter_raw(self):
+                yield b'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n'
+                yield b'data: [DONE]\n\n'
+            async def aclose(self):
+                pass
+
+        class MockClient:
+            def __init__(self, *args, **kwargs):
+                self.is_closed = False
+            def build_request(self, method, url, **kwargs):
+                return None
+            async def send(self, req, stream=False):
+                return MockStreamResponse()
+            async def aclose(self):
+                self.is_closed = True
+
+        mock_client = MockClient()
+        with patch("gateway_server.httpx.AsyncClient", return_value=mock_client):
+            resp = asyncio.run(gateway_server.chat_completions(req_stream))
+            self.assertEqual(resp.media_type, "text/event-stream")
+
+            async def read_stream(streaming_resp):
+                chunks = []
+                async for chunk in streaming_resp.body_iterator:
+                    if isinstance(chunk, bytes):
+                        chunks.append(chunk.decode("utf-8"))
+                    else:
+                        chunks.append(chunk)
+                return "".join(chunks)
+
+            output = asyncio.run(read_stream(resp))
+            self.assertIn("Hello", output)
+            self.assertIn("[DONE]", output)
+            self.assertTrue(mock_client.is_closed)
+
 if __name__ == "__main__":
     unittest.main()
