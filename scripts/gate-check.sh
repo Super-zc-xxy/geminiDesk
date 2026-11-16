@@ -32,6 +32,13 @@ fi
 if [ -f scripts/validate-skills.js ] && command -v node >/dev/null 2>&1; then
   node scripts/validate-skills.js < /dev/null
 fi
+if [ -d tests ]; then
+  if [ -f deepseek_venv/Scripts/python.exe ]; then
+    ./deepseek_venv/Scripts/python.exe -m unittest discover -s tests < /dev/null
+  elif command -v python >/dev/null 2>&1; then
+    python -m unittest discover -s tests < /dev/null
+  fi
+fi
 
 echo "[Gate 4/4] Basic Secret & Debug Leftover Scan..."
 SECRET_ONLY_PATTERN='^\+.*(AKIA[0-9A-Z]{16}|sk-[a-zA-Z0-9]{20,})'

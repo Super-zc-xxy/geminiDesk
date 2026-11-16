@@ -23,10 +23,17 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 INTERNAL_GEMINI_PORT = 8085
+INTERNAL_DEEPSEEK_PORT = 8087
 PUBLIC_PORT = 8090
 
 GEMINI_EXE = os.path.join(BASE_DIR, "gemini-web2api.exe")
 GEMINI_COOKIE_FILE = os.path.join(BASE_DIR, "cookie.txt")
+DEEPSEEK_SERVER_PY = os.path.join(BASE_DIR, "deepseek_server.py")
+DEEPSEEK_TOKEN_FILE = os.path.join(BASE_DIR, "deepseek_token.txt")
+DEEPSEEK_VENV_PYTHON = os.path.join(BASE_DIR, "deepseek_venv", "Scripts", "python.exe")
+if not os.path.exists(DEEPSEEK_VENV_PYTHON):
+    DEEPSEEK_VENV_PYTHON = sys.executable
+
 GATEWAY_SERVER_PY = os.path.join(BASE_DIR, "gateway_server.py")
 CONFIG_FILE = os.path.join(BASE_DIR, "settings_config.json")
 APP_ICON = os.path.join(BASE_DIR, "app.ico")
@@ -39,6 +46,9 @@ DEFAULT_CONFIG = {
 }
 
 MODEL_OPTIONS = [
+    ("deepseek-v4.1-flash (DeepSeek 4.1 Flash - 极速日常 - 推荐)", "deepseek-v4.1-flash"),
+    ("deepseek-v4.1-pro (DeepSeek 4.1 Pro - 专家重构)", "deepseek-v4.1-pro"),
+    ("deepseek-v4.1-thinking (DeepSeek 4.1 深度思考)", "deepseek-v4.1-thinking"),
     ("gemini-4-hydrogen (Google 4 Hydrogen - 最新日常极速 - 推荐)", "gemini-4-hydrogen"),
     ("gemini-3.8-flash (Google 3.8 Flash - 高速代码开发)", "gemini-3.8-flash"),
     ("gemini-flash-lite (Google 3.5 Flash-Lite - 秒级快速解答)", "gemini-flash-lite"),
@@ -111,6 +121,7 @@ class UnifiedServiceCard(ModernCard):
         super().__init__()
         self.main_win = main_win
         self.proc_gemini = None
+        self.proc_deepseek = None
         self.proc_gateway = None
 
         self.init_card_ui()
@@ -268,7 +279,7 @@ class UnifiedServiceCard(ModernCard):
 
     def sync_models_from_backend(self, show_msg=True):
         try:
-            resp = requests.get(f"http://127.0.0.1:{PUBLIC_PORT}/v1/models", timeout=3)
+            resp = requests.get(f"http://127.0.0.1:{PUBLIC_PORT}/v1/models", timeout=3, proxies={"http": None, "https": None})
             if resp.status_code == 200:
                 data = resp.json().get("data", [])
                 backend_models = [item.get("id") for item in data if item.get("id")]
@@ -314,12 +325,14 @@ class UnifiedServiceCard(ModernCard):
             return True
         if self.proc_gateway and self.proc_gateway.poll() is None:
             return True
+        if self.proc_deepseek and self.proc_deepseek.poll() is None:
+            return True
         return False
 
     def sync_ui_status(self, running: bool):
         if running:
             self.status_icon.setStyleSheet("color: #22c55e; font-size: 22px;")
-            self.status_text.setText(f"状态：🟢 正在运行中 (公共网关: {PUBLIC_PORT} | Gemini内核: 8085)")
+            self.status_text.setText(f"状态：🟢 正在运行中 (公共网关: {PUBLIC_PORT} | Gemini: {INTERNAL_GEMINI_PORT} | DeepSeek: {INTERNAL_DEEPSEEK_PORT})")
             self.status_text.setStyleSheet("color: #16a34a; font-weight: bold; font-size: 13px;")
             self.btn_toggle.setText("停止服务")
             self.btn_toggle.setStyleSheet("""
@@ -365,11 +378,14 @@ class UnifiedServiceCard(ModernCard):
             QMessageBox.warning(self, "错误", f"找不到 Gemini 可执行程序：\n{GEMINI_EXE}")
             return
 
-        python_exe = r"E:\Hermes\hermes-agent\venv\Scripts\python.exe"
+        python_exe = os.path.join(BASE_DIR, "deepseek_venv", "Scripts", "python.exe")
+        if not os.path.exists(python_exe):
+            python_exe = r"E:\Hermes\hermes-agent\venv\Scripts\python.exe"
         if not os.path.exists(python_exe):
             python_exe = sys.executable
 
         kill_port_owner(INTERNAL_GEMINI_PORT)
+        kill_port_owner(INTERNAL_DEEPSEEK_PORT)
         kill_port_owner(PUBLIC_PORT)
         time.sleep(0.3)
 
@@ -400,7 +416,22 @@ class UnifiedServiceCard(ModernCard):
             )
             threading.Thread(target=lambda: self.stream_logs(self.proc_gemini, "Gemini核心"), daemon=True).start()
 
-            # 2. 启动对外统一网关 (8090)
+            # 2. 启动内部 DeepSeek 核心 (8087)
+            if os.path.exists(DEEPSEEK_SERVER_PY):
+                ds_python = DEEPSEEK_VENV_PYTHON if os.path.exists(DEEPSEEK_VENV_PYTHON) else sys.executable
+                self.proc_deepseek = subprocess.Popen(
+                    [ds_python, DEEPSEEK_SERVER_PY, str(INTERNAL_DEEPSEEK_PORT)],
+                    cwd=BASE_DIR,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    creationflags=creationflags,
+                    encoding="utf-8",
+                    errors="replace"
+                )
+                threading.Thread(target=lambda: self.stream_logs(self.proc_deepseek, "DeepSeek核心"), daemon=True).start()
+
+            # 3. 启动对外统一网关 (8090)
             self.proc_gateway = subprocess.Popen(
                 [python_exe, GATEWAY_SERVER_PY, str(PUBLIC_PORT)],
                 cwd=BASE_DIR,
@@ -414,7 +445,7 @@ class UnifiedServiceCard(ModernCard):
             threading.Thread(target=lambda: self.stream_logs(self.proc_gateway, "Gemini智能网关"), daemon=True).start()
 
             self.sync_ui_status(True)
-            self.main_win.append_log(f"[服务管理] Web2API Gemini 反代服务已启动！统一监听端口: {PUBLIC_PORT} (Gemini内核: {INTERNAL_GEMINI_PORT})")
+            self.main_win.append_log(f"[服务管理] Web2API 双引擎反代服务已启动！统一监听端口: {PUBLIC_PORT} (Gemini: {INTERNAL_GEMINI_PORT} | DeepSeek: {INTERNAL_DEEPSEEK_PORT})")
             QTimer.singleShot(2500, lambda: self.sync_models_from_backend(False))
         except Exception as e:
             self.sync_ui_status(False)
@@ -437,6 +468,14 @@ class UnifiedServiceCard(ModernCard):
                 self.proc_gateway.kill()
             self.proc_gateway = None
 
+        if self.proc_deepseek:
+            self.proc_deepseek.terminate()
+            try:
+                self.proc_deepseek.wait(timeout=1.5)
+            except subprocess.TimeoutExpired:
+                self.proc_deepseek.kill()
+            self.proc_deepseek = None
+
         if self.proc_gemini:
             self.proc_gemini.terminate()
             try:
@@ -446,6 +485,7 @@ class UnifiedServiceCard(ModernCard):
             self.proc_gemini = None
 
         kill_port_owner(INTERNAL_GEMINI_PORT)
+        kill_port_owner(INTERNAL_DEEPSEEK_PORT)
         kill_port_owner(PUBLIC_PORT)
 
         self.sync_ui_status(False)
@@ -453,7 +493,7 @@ class UnifiedServiceCard(ModernCard):
 
     def test_connection(self):
         try:
-            resp = requests.get(f"http://127.0.0.1:{PUBLIC_PORT}/v1/models", timeout=3)
+            resp = requests.get(f"http://127.0.0.1:{PUBLIC_PORT}/v1/models", timeout=3, proxies={"http": None, "https": None})
             if resp.status_code == 200:
                 self.sync_ui_status(True)
                 data = resp.json()
@@ -696,6 +736,33 @@ class MainWindow(QMainWindow):
 
         tabs.addTab(tab_gemini, "Gemini Cookie 凭据")
 
+        # Tab: DeepSeek Token 凭据
+        tab_deepseek = QWidget()
+        d_layout = QVBoxLayout(tab_deepseek)
+        d_tip = QLabel("DeepSeek 网页端 Token 凭据 (deepseek_token.txt 内容)：")
+        d_tip.setStyleSheet("font-weight: bold; color: #1e293b;")
+        d_layout.addWidget(d_tip)
+
+        self.edit_deepseek_token = QTextEdit()
+        self.edit_deepseek_token.setStyleSheet("font-family: Consolas; font-size: 11px; border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px;")
+        if os.path.exists(DEEPSEEK_TOKEN_FILE):
+            try:
+                with open(DEEPSEEK_TOKEN_FILE, "r", encoding="utf-8") as f:
+                    self.edit_deepseek_token.setPlainText(f.read())
+            except Exception:
+                pass
+        d_layout.addWidget(self.edit_deepseek_token)
+
+        btn_save_d = QPushButton("保存 DeepSeek 凭据")
+        btn_save_d.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold; padding: 6px 16px; border-radius: 6px;")
+        btn_save_d.clicked.connect(self.save_deepseek_token)
+        d_btn_row = QHBoxLayout()
+        d_btn_row.addStretch()
+        d_btn_row.addWidget(btn_save_d)
+        d_layout.addLayout(d_btn_row)
+
+        tabs.addTab(tab_deepseek, "DeepSeek Token 凭据")
+
         layout.addWidget(tabs)
 
         # 开机自启动设置
@@ -793,6 +860,19 @@ class MainWindow(QMainWindow):
                 f.write(content)
             QMessageBox.information(self, "保存成功", "Gemini Cookie 已更新保存！")
             self.append_log("[配置保存] Gemini Cookie 凭据已成功写入 cookie.txt。")
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", f"写入失败：{e}")
+
+    def save_deepseek_token(self):
+        content = self.edit_deepseek_token.toPlainText().strip()
+        if not content:
+            QMessageBox.warning(self, "提示", "DeepSeek Token 内容不能为空！")
+            return
+        try:
+            with open(DEEPSEEK_TOKEN_FILE, "w", encoding="utf-8") as f:
+                f.write(content)
+            QMessageBox.information(self, "保存成功", "DeepSeek Token 已更新保存！")
+            self.append_log("[配置保存] DeepSeek Token 凭据已成功写入 deepseek_token.txt。")
         except Exception as e:
             QMessageBox.critical(self, "保存失败", f"写入失败：{e}")
 
@@ -904,7 +984,7 @@ class MainWindow(QMainWindow):
 
         # 2. 服务状态
         running = self.card_service.is_running()
-        status_text = "🟢 Gemini 反代: 运行中 (点击暂停)" if running else "🔴 Gemini 反代: 已停止 (点击启动)"
+        status_text = "🟢 双引擎反代: 运行中 (点击暂停)" if running else "🔴 双引擎反代: 已停止 (点击启动)"
         act_toggle = self.tray_menu.addAction(status_text)
         act_toggle.triggered.connect(self.card_service.toggle_service)
 

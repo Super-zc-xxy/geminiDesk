@@ -7,6 +7,14 @@
             "port": 8081,
             "work_dir": "E:\\GeminiDeskTop",
             "auto_start": true
+        },
+        {
+            "id": "deepseek",
+            "name": "DeepSeek V4.1 Web2API Core",
+            "exec_path": "E:\\GeminiDeskTop\\deepseek_server.py",
+            "port": 8087,
+            "work_dir": "E:\\GeminiDeskTop",
+            "auto_start": true
         }
     ]
 }

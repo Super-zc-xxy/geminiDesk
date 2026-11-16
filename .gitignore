@@ -9,6 +9,7 @@ __pycache__/
 *.exe
 build/
 dist/
+*venv/
 
 # Sensitive tokens & cookies
 cookie.txt*

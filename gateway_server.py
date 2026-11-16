@@ -3,7 +3,9 @@ import sys
 import json
 import uuid
 import time
+import asyncio
 import httpx
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
@@ -11,8 +13,19 @@ import uvicorn
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "settings_config.json")
 INTERNAL_GEMINI_PORT = 8085
+INTERNAL_DEEPSEEK_PORT = 8087
 
-app = FastAPI(title="Web2API Gemini Dedicated Gateway")
+http_client: httpx.AsyncClient = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client
+    limits = httpx.Limits(max_keepalive_connections=200, max_connections=1000)
+    http_client = httpx.AsyncClient(limits=limits, timeout=120.0, trust_env=False)
+    yield
+    await http_client.aclose()
+
+app = FastAPI(title="Web2API Dual-Engine Universal Gateway", lifespan=lifespan)
 
 def get_current_model_choice():
     """读取用户在 UI 中选择的目标模型"""
@@ -26,24 +39,57 @@ def get_current_model_choice():
     return "gemini-3.8-flash"
 
 def resolve_target_model(client_model: str) -> str:
-    # 1. 软件界面选定优先：如果用户在 Web2API Hub 界面中手动选定了具体模型（非 auto），以界面选择为准
+    cm = (client_model or "").strip()
+    cm_lower = cm.lower()
+
+    # 1. 如果客户端显式请求已知特定模型，遵从客户端意图，杜绝跨引擎误劫持
+    # DeepSeek 家族特有标识：
+    if "deepseek" in cm_lower or cm_lower in ("r1", "v4") or any(p in ("r1", "v4") for p in cm_lower.replace("_", "-").split("-")):
+        return cm
+    # Gemini 家族特有标识：
+    if any(kw in cm_lower for kw in ["gemini", "hydrogen", "argon", "carbon"]):
+        return cm
+
+    # 2. 读取软件界面选定模型
     chosen = get_current_model_choice()
+
+    # 3. 如果客户端传来的是通用/旧代号（gpt/o1/o3/chatgpt）或缺省（空/default/auto）
+    if not cm or cm_lower in ("default", "auto") or any(kw in cm_lower for kw in ["gpt", "o1", "o3", "chatgpt"]):
+        if chosen and chosen != "auto":
+            return chosen
+        return "gemini-4-hydrogen"
+
+    # 4. 如果软件界面手动选定了具体模型（非 auto），优先使用界面选定模型
     if chosen and chosen != "auto":
         return chosen
 
-    # 2. 如果软件界面设置为 auto，则以客户端（Trae / Cursor 等）当前选定的模型为准
-    if client_model and client_model not in ("default", "auto", ""):
-        # 如果客户端传来的是旧的 gpt 相关代号，自动重定向到极速 Gemini 代码模型
-        if any(kw in client_model.lower() for kw in ["gpt", "o1", "o3", "chatgpt"]):
-            return "gemini-3.8-flash"
-        return client_model
+    # 5. 软件界面为 auto 时，以客户端传入模型为准
+    return cm
 
-    return "gemini-3.8-flash"
+def resolve_backend_engine(target_model: str) -> str:
+    """
+    根据目标模型名称判决后端引擎：
+    - 若包含 'deepseek' 或等于 'r1', 'v4' 或以 'r1', 'v4' 作为独立标识，判定为 'deepseek' (8087)
+    - 否则判定为 'gemini' (8085)
+    """
+    if not target_model:
+        return "gemini"
+    tm = str(target_model).lower().strip()
+    if "deepseek" in tm or tm in ("r1", "v4"):
+        return "deepseek"
+    parts = tm.replace("_", "-").split("-")
+    if any(p in ("r1", "v4") for p in parts):
+        return "deepseek"
+    return "gemini"
+
+def get_engine_port(engine: str) -> int:
+    return INTERNAL_DEEPSEEK_PORT if engine == "deepseek" else INTERNAL_GEMINI_PORT
 
 @app.get("/v1/models")
 async def list_models():
     now = int(time.time())
     models_set = {
+        # Gemini 家族模型
         "gemini-4-hydrogen",
         "hydrogen",
         "gemini-4-argon",
@@ -54,18 +100,40 @@ async def list_models():
         "gemini-3.5-flash-thinking",
         "gemini-3.1-pro",
         "gemini-auto",
-        "auto"
+        "auto",
+        # DeepSeek 系列模型
+        "deepseek-v4.1-flash",
+        "deepseek-v4.1-pro",
+        "deepseek-v4.1-thinking",
+        "deepseek-chat",
+        "deepseek-reasoner"
     }
 
-    # 从 Gemini (8085) 动态探测
+    # 动态并发探测双引擎 (8085 与 8087)
+    async def probe_port(port: int):
+        try:
+            async with httpx.AsyncClient(timeout=2.0, trust_env=False) as client:
+                resp = await client.get(f"http://127.0.0.1:{port}/v1/models")
+                if resp.status_code == 200:
+                    data = resp.json().get("data", [])
+                    return [
+                        m.get("id") for m in data
+                        if m.get("id") and not any(kw in m.get("id").lower() for kw in ["gpt", "o1", "o3", "chatgpt", "terra", "luna"])
+                    ]
+        except Exception:
+            pass
+        return []
+
     try:
-        async with httpx.AsyncClient(timeout=2.0, trust_env=False) as client:
-            resp = await client.get(f"http://127.0.0.1:{INTERNAL_GEMINI_PORT}/v1/models")
-            if resp.status_code == 200:
-                for item in resp.json().get("data", []):
-                    mid = item.get("id")
-                    if mid and not any(kw in mid.lower() for kw in ["gpt", "o1", "o3", "chatgpt", "terra", "luna"]):
-                        models_set.add(mid)
+        results = await asyncio.gather(
+            probe_port(INTERNAL_GEMINI_PORT),
+            probe_port(INTERNAL_DEEPSEEK_PORT),
+            return_exceptions=True
+        )
+        for res in results:
+            if isinstance(res, list):
+                for mid in res:
+                    models_set.add(mid)
     except Exception:
         pass
 
@@ -75,8 +143,11 @@ async def list_models():
         "data": [{"id": m, "object": "model", "created": now, "owned_by": "web2api-hub"} for m in sorted_models]
     }
 
-async def call_gemini_backend_stream(messages: list, target_model: str):
-    backend_url = f"http://127.0.0.1:{INTERNAL_GEMINI_PORT}/v1/chat/completions"
+async def call_backend_stream(messages: list, target_model: str):
+    engine = resolve_backend_engine(target_model)
+    port = get_engine_port(engine)
+    engine_name = "DeepSeek" if engine == "deepseek" else "Gemini"
+    backend_url = f"http://127.0.0.1:{port}/v1/chat/completions"
     payload = {
         "model": target_model,
         "messages": messages,
@@ -88,7 +159,7 @@ async def call_gemini_backend_stream(messages: list, target_model: str):
             async with client.stream("POST", backend_url, json=payload) as resp:
                 if resp.status_code != 200:
                     err_text = await resp.aread()
-                    yield f"[Gemini核心 提示 {resp.status_code}]: 请确认后端服务已启动！\n详情: {err_text.decode('utf-8', errors='ignore')}"
+                    yield f"[{engine_name}核心 提示 {resp.status_code}]: 请确认后端服务已启动！\n详情: {err_text.decode('utf-8', errors='ignore')}"
                     return
 
                 async for line in resp.aiter_lines():
@@ -101,15 +172,21 @@ async def call_gemini_backend_stream(messages: list, target_model: str):
                         data_json = json.loads(data_str)
                         choices = data_json.get("choices", [])
                         if choices:
-                            delta_content = choices[0].get("delta", {}).get("content", "")
-                            if delta_content:
-                                yield delta_content
+                            delta_obj = choices[0].get("delta", {})
+                            delta_content = delta_obj.get("content", "") or ""
+                            reasoning_content = delta_obj.get("reasoning_content", "") or ""
+                            combined = reasoning_content + delta_content
+                            if combined:
+                                yield combined
                     except Exception:
                         continue
         except httpx.ConnectError:
-            yield f"【连接失败】：无法连接到 Gemini 核心 (端口 {INTERNAL_GEMINI_PORT})。请在 Web2API 管理中心中确认对应服务处于运行中！"
+            yield f"【连接失败】：无法连接到 {engine_name} 核心 (端口 {port})。请在 Web2API 管理中心中确认对应服务处于运行中！"
         except Exception as e:
             yield f"[转接异常]: {str(e)}"
+
+# 兼容历史调用方
+call_gemini_backend_stream = call_backend_stream
 
 # ================= 适配 Codex (/v1/responses) =================
 @app.post("/v1/responses")
@@ -117,6 +194,7 @@ async def handle_responses_api(request: Request):
     body = await request.json()
     client_model = body.get("model", "gpt-4o")
     target_model = resolve_target_model(client_model)
+    engine = resolve_backend_engine(target_model)
     stream = body.get("stream", True)
 
     messages = []
@@ -147,11 +225,12 @@ async def handle_responses_api(request: Request):
     if not messages:
         messages = [{"role": "user", "content": "你好"}]
 
-    guard_instruction = "Answer directly in text or code without invoking Google Drive, Gmail, or Google Workspace extensions."
-    if messages and messages[0].get("role") == "system":
-        messages[0]["content"] = f"{messages[0].get('content', '')}\n{guard_instruction}"
-    else:
-        messages.insert(0, {"role": "system", "content": guard_instruction})
+    if engine == "gemini":
+        guard_instruction = "Answer directly in text or code without invoking Google Drive, Gmail, or Google Workspace extensions."
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = f"{messages[0].get('content', '')}\n{guard_instruction}"
+        else:
+            messages.insert(0, {"role": "system", "content": guard_instruction})
 
     resp_id = f"resp_{uuid.uuid4().hex[:16]}"
     msg_id = f"msg_{uuid.uuid4().hex[:16]}"
@@ -189,7 +268,7 @@ async def handle_responses_api(request: Request):
                 yield f"event: response.output_item.added\ndata: {json.dumps(item_added_evt, ensure_ascii=False)}\n\n"
 
                 # 3. 逐字流式打字
-                async for delta in call_gemini_backend_stream(messages, target_model):
+                async for delta in call_backend_stream(messages, target_model):
                     accumulated_text += delta
                     delta_evt = {
                         "type": "response.output_text.delta",
@@ -246,7 +325,7 @@ async def handle_responses_api(request: Request):
         return StreamingResponse(response_stream_generator(), media_type="text/event-stream")
     else:
         full_text = ""
-        async for delta in call_gemini_backend_stream(messages, target_model):
+        async for delta in call_backend_stream(messages, target_model):
             full_text += delta
         return {
             "id": resp_id,
@@ -281,62 +360,74 @@ def extract_text_content(val):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
-    client_model = body.get("model", "gemini-4-argon")
+    client_model = body.get("model", "")
+    is_stream = bool(body.get("stream", False))
+    
     target_model = resolve_target_model(client_model)
+    engine = resolve_backend_engine(target_model)
+    port = get_engine_port(engine)
+    engine_name = "DeepSeek" if engine == "deepseek" else "Gemini"
+    backend_url = f"http://127.0.0.1:{port}/v1/chat/completions"
+    
     body["model"] = target_model
+    headers = {"Authorization": request.headers.get("Authorization", "")} if request.headers.get("Authorization") else {"Content-Type": "application/json"}
 
-    raw_messages = body.get("messages", [])
-    # 自动净化过滤被 Google Workspace / Drive 错误污染的历史轮次
-    messages = []
-    for m in raw_messages:
-        content_txt = extract_text_content(m.get("content", ""))
-        if "I can't use Google Drive" in content_txt or "required Gmail settings are off" in content_txt:
-            continue
-        messages.append(m)
-
-    if not messages:
-        messages = [{"role": "user", "content": "hi"}]
-
-    backend_url = f"http://127.0.0.1:{INTERNAL_GEMINI_PORT}/v1/chat/completions"
-
-    # 针对 Google Gemini 引擎加入静默防护，避免触发 Google Workspace / Gmail 插件提示
-    guard_instruction = "Answer directly in text or code without invoking Google Drive, Gmail, or Google Workspace extensions."
-    if messages and messages[0].get("role") == "system":
-        messages[0]["content"] = f"{extract_text_content(messages[0].get('content', ''))}\n{guard_instruction}"
-    else:
-        messages.insert(0, {"role": "system", "content": guard_instruction})
-
-    body["messages"] = messages
-    headers = {"Content-Type": "application/json"}
-    if "authorization" in request.headers:
-        headers["Authorization"] = request.headers["authorization"]
-
-    if body.get("stream", False):
-        async def stream_generator():
+    if is_stream:
+        try:
             async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
                 req = client.build_request("POST", backend_url, json=body, headers=headers)
-                r = await client.send(req, stream=True)
-                async for chunk in r.aiter_raw():
-                    yield chunk
-
-        return StreamingResponse(
-            stream_generator(),
-            status_code=200,
-            headers={
-                "Content-Type": "text/event-stream; charset=utf-8",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no"
+                resp = await client.send(req, stream=True)
+                if resp.status_code != 200:
+                    error_body = await resp.aread()
+                    return Response(error_body, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
+                
+                async def stream_generator():
+                    try:
+                        async for chunk in resp.aiter_raw():
+                            yield chunk
+                    finally:
+                        await resp.aclose()
+                        
+                return StreamingResponse(
+                    stream_generator(),
+                    status_code=resp.status_code,
+                    media_type="text/event-stream"
+                )
+        except httpx.ConnectError:
+            err_chunk = {
+                "id": f"chatcmpl-err-{uuid.uuid4().hex[:8]}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": target_model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": f"【连接失败】：无法连接到 {engine_name} 核心 (端口 {port})。请在 Web2API 管理中心中确认对应服务处于运行中！"},
+                    "finish_reason": "stop"
+                }]
             }
-        )
+            async def err_stream():
+                yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
+            return StreamingResponse(err_stream(), media_type="text/event-stream")
+        except Exception as e:
+            return JSONResponse({"error": {"message": f"代理转接异常: {str(e)}"}}, status_code=500)
     else:
-        async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
-            resp = await client.post(backend_url, json=body, headers=headers)
-            return Response(
-                content=resp.content,
-                status_code=resp.status_code,
-                media_type=resp.headers.get("content-type", "application/json")
-            )
+        try:
+            async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
+                resp = await client.post(backend_url, json=body, headers=headers)
+                return Response(
+                    content=resp.content,
+                    status_code=resp.status_code,
+                    media_type=resp.headers.get("content-type", "application/json")
+                )
+        except httpx.ConnectError:
+            return JSONResponse({
+                "error": {
+                    "message": f"【连接失败】：无法连接到 {engine_name} 核心 (端口 {port})。请在 Web2API 管理中心中确认对应服务处于运行中！"
+                }
+            }, status_code=502)
+        except Exception as e:
+            return JSONResponse({"error": {"message": f"代理转接异常: {str(e)}"}}, status_code=500)
 
 if __name__ == "__main__":
     port = 8090
@@ -345,5 +436,7 @@ if __name__ == "__main__":
             port = int(sys.argv[1])
         except Exception:
             pass
-    print(f"[Gemini Universal Gateway] Listening on http://0.0.0.0:{port} -> Internal Engine :8085")
+    print(f"[Universal Gateway] Listening on http://0.0.0.0:{port} -> Gemini :8085 / DeepSeek :8087")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+
+
